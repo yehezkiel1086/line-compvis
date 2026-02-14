@@ -7,11 +7,7 @@ class DatabaseHandler:
     def __init__(self):
         self.conn = self._connect()
         self.cursor = self.conn.cursor()
-        self.last_status_input = None
-        self.last_parplt_time = None
-        self.error_counter = 0
-        self.load_error_counter()
-        print("✅ PLC Database Handler Initialized")
+        print("✅ Server DB Handler Initialized")
 
     def _connect(self):
         return pyodbc.connect(
@@ -21,62 +17,55 @@ class DatabaseHandler:
             autocommit=True
         )
 
-    def load_error_counter(self):
-        try:
-            self.cursor.execute("SELECT TOP 1 datecode FROM dbo.z_par_plt WITH (NOLOCK) WHERE datecode LIKE 'ERROR-%' ORDER BY created_at DESC")
-            row = self.cursor.fetchone()
-            if row and row[0]:
-                self.error_counter = int(row[0].split("-")[-1])
-        except: self.error_counter = 0
-
-    def get_next_error_code(self):
-        self.error_counter += 1
-        return f"ERROR-{self.error_counter:05d}"
-
-    def check_input_trigger(self):
-        """Polls z_test_vision. Returns True on rising edge (0->1)."""
+    def get_current_input(self):
+        """Just returns the current value (0 or 1). Logic is on Client."""
         try:
             self.cursor.execute("SELECT TOP 1 status_input FROM dbo.z_test_vision WITH (NOLOCK) ORDER BY created_at DESC")
             row = self.cursor.fetchone()
-            if row:
-                status = int(row[0])
-                if self.last_status_input is None:
-                    self.last_status_input = status
-                    return False
-                if self.last_status_input == 0 and status == 1:
-                    self.last_status_input = status
-                    return True
-                self.last_status_input = status
-        except Exception as e:
-            print(f"PLC Read Error: {e}")
-            try: self.conn = self._connect(); self.cursor = self.conn.cursor()
-            except: pass
-        return False
+            return int(row[0]) if row else 0
+        except:
+            self._reconnect()
+            return 0
 
     def get_pending_row(self):
-        """Gets the row ID in z_par_plt waiting for result."""
+        """Returns row waiting for result."""
         try:
             self.cursor.execute("""
                 SELECT TOP 1 id, created_at FROM dbo.z_par_plt WITH (NOLOCK)
                 WHERE datecode IS NULL ORDER BY created_at DESC
             """)
-            return self.cursor.fetchone()
-        except: return None
+            row = self.cursor.fetchone()
+            if row:
+                # Return created_at as ISO string for JSON serialization
+                return {"id": row[0], "created_at": row[1].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}
+        except: pass
+        return None
 
-    def fast_update_db(self, created_at, datecode, status):
+    def update_result(self, created_at, datecode, status, image_path, text_path):
+        """Writes the final result and paths to DB."""
         try:
+            # Flexible query: Matches row roughly created at the same time
             self.cursor.execute("""
-                UPDATE dbo.z_par_plt SET datecode = ?, status = ?
-                WHERE created_at BETWEEN DATEADD(ms,-500,?) AND DATEADD(ms, 500,?)
-            """, datecode, status, created_at, created_at)
+                UPDATE dbo.z_par_plt 
+                SET datecode = ?, status = ?, image_path = ?, text_path = ?
+                WHERE created_at BETWEEN DATEADD(ms,-900,?) AND DATEADD(ms, 900,?)
+            """, datecode, status, image_path, text_path, created_at, created_at)
+            return True
         except Exception as e:
-            print("Fast Update Error:", e)
+            print(f"DB Write Error: {e}")
+            return False
 
-    def update_paths(self, created_at, image_path, text_path):
+    def get_next_error_code(self):
         try:
-            self.cursor.execute("""
-                UPDATE dbo.z_par_plt SET image_path = ?, text_path = ?
-                WHERE created_at BETWEEN DATEADD(ms,-500,?) AND DATEADD(ms, 500,?)
-            """, image_path, text_path, created_at, created_at)
-        except Exception as e:
-            print("Path Update Error:", e)
+            self.cursor.execute("SELECT TOP 1 datecode FROM dbo.z_par_plt WITH (NOLOCK) WHERE datecode LIKE 'ERROR-%' ORDER BY created_at DESC")
+            row = self.cursor.fetchone()
+            num = int(row[0].split("-")[-1]) if row else 0
+            return f"ERROR-{num + 1:05d}"
+        except:
+            return "ERROR-00001"
+
+    def _reconnect(self):
+        try:
+            self.conn = self._connect()
+            self.cursor = self.conn.cursor()
+        except: pass
