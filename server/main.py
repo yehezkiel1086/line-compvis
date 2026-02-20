@@ -1,6 +1,12 @@
 import os
-# Force CPU usage: This must be set BEFORE importing torch or vision modules
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+# ============================================================
+# GPU CONFIGURATION — NVIDIA RTX 4090 (CUDA)
+# This must be set BEFORE importing torch or vision modules.
+# Removes the CPU-only restriction so CUDA devices are visible.
+# ============================================================
+os.environ.pop("CUDA_VISIBLE_DEVICES", None)   # Remove any CPU-only override
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"        # Use primary GPU (RTX 4090)
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"        # Easier CUDA error tracing during dev
 
 from fastapi import FastAPI, UploadFile, File
 import uvicorn
@@ -19,10 +25,25 @@ from server.corrector import reconstruct_datecode, majority_status, stats_digit
 
 app = FastAPI()
 
-# Initializing here ensures they respect the environment variable above
-print("🖥️ Starting Server in CPU-ONLY mode...")
+# Initializing here ensures they respect the CUDA environment variables above.
+# VisionEngine and all torch/YOLO/OCR models will load onto the RTX 4090.
+print("🖥️  Starting Server in GPU mode — targeting NVIDIA RTX 4090 (CUDA:0)...")
+
+# Runtime CUDA availability check (informational, does not block startup)
+try:
+    import torch
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram    = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        print(f"✅ CUDA device detected : {gpu_name} ({vram:.1f} GB VRAM)")
+    else:
+        print("⚠️  WARNING: CUDA is not available — falling back to CPU. "
+              "Check CUDA / cuDNN installation and driver compatibility.")
+except ImportError:
+    print("⚠️  torch not importable at startup check — skipping CUDA validation.")
+
 vision = VisionEngine()
-db = DatabaseHandler()
+db     = DatabaseHandler()
 
 # --- PLC / DB ENDPOINTS ---
 @app.get("/plc/input")
@@ -56,7 +77,7 @@ def write_db(data: dict):
 async def inspect_and_upload(files: list[UploadFile], created_at: str, error_code: str):
     """
     1. Receives images
-    2. Runs Vision (YOLO/OCR) on CPU
+    2. Runs Vision (YOLO/OCR) on GPU (NVIDIA RTX 4090)
     3. Uploads results to PHP
     """
     # Decode Images
@@ -70,11 +91,11 @@ async def inspect_and_upload(files: list[UploadFile], created_at: str, error_cod
 
     # Run Vision
     raw_dates = []
-    best_roi = None
+    best_roi  = None
     last_frame = frames[-1] if frames else None
 
     for frame in frames:
-        # VisionEngine is now running in CPU mode
+        # VisionEngine is now running on CUDA (RTX 4090)
         text, roi = vision.process_frame(frame)
         if roi is not None: 
             best_roi = roi
@@ -87,13 +108,13 @@ async def inspect_and_upload(files: list[UploadFile], created_at: str, error_cod
     counter = Counter(raw_dates)
     if raw_dates:
         final_dc = reconstruct_datecode(raw_dates)
-        status = majority_status(counter)
+        status   = majority_status(counter)
         if not final_dc.strip():
             final_dc = error_code
-            status = "NO VALID"
+            status   = "NO VALID"
     else:
         final_dc = error_code
-        status = "NO VALID"
+        status   = "NO VALID"
 
     # Upload to PHP
     img_path = None
@@ -103,12 +124,12 @@ async def inspect_and_upload(files: list[UploadFile], created_at: str, error_cod
     txt_path = upload_text_php(created_at, final_dc, raw_dates)
 
     return {
-        "datecode": final_dc,
-        "status": status,
-        "raw_dates": raw_dates,
+        "datecode":    final_dc,
+        "status":      status,
+        "raw_dates":   raw_dates,
         "stats_digit": stats_digit(raw_dates),
-        "image_path": img_path,
-        "text_path": txt_path
+        "image_path":  img_path,
+        "text_path":   txt_path
     }
 
 # --- HELPERS ---
